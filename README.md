@@ -2,6 +2,9 @@
 
 **Statistical Data Analysis | R | Data Visualization | Regression Modeling**
 
+## View Full Analysis
+
+📊 [View the Interactive Analysis Report](https://shdift09.github.io/seoul-housing-crime-analysis/Seoul_Crime_Housing_Analysis.html)
 ## Project Overview
 
 This project investigates the relationship between apartment transaction prices and recorded crime rates across Seoul's 25 districts from 2014 to 2022.
