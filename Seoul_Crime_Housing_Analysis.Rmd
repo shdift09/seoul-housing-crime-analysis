@@ -1,0 +1,1117 @@
+---
+title: "Relationship Between Apartment Prices and Crime Rates in Seoul"
+author: "Jimin Lee"
+subtitle: CDS 101 | Statistical Data Analysis | 2014–2022
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+  pdf_document:
+    toc: true
+    toc_depth: '3'
+---
+# Project Overview
+
+**Research Question**: Is there an association between apartment transaction prices and recorded crime rates across Seoul districts?
+
+This project investigates the relationship between apartment transaction prices and recorded crime rates across Seoul's 25 districts, using publicly available data from 2014 to 2022.
+
+Three datasets containing apartment transaction prices, five major crime categories, and district-level population statistics are integrated to examine geographic and temporal patterns in crime rates and their associations with apartment prices.
+
+The analysis includes data preprocessing, exploratory data analysis, visualization, linear regression, hypothesis testing, multiple-testing correction, district and year fixed effects modeling, cluster bootstrap confidence intervals, effect size estimation, and sensitivity analysis.
+
+As this is an observational study, the findings describe statistical associations rather than establishing causal relationships.
+
+**Project Background**
+
+This study originated as a group project for CDS 101 (Statistical Data Analysis) at George Mason University.
+
+For this portfolio, I independently revisited the original datasets, restructured the analysis workflow, refined the statistical interpretations, and expanded the methodology to examine the robustness and limitations of the initial findings.
+
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(broom)
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+```
+
+# Data loading
+
+```{r}
+crime_raw <- read_csv("Five_Major_Crime.csv",
+show_col_types = FALSE)
+population_raw <- read_csv("Population_Per_District.csv", show_col_types = FALSE)
+housing_raw <- read_csv("Real_Estate_Seoul.csv", show_col_types = FALSE)
+
+cat("Housing transactions:", nrow(housing_raw), "\n")
+cat("Crime file rows (includes category header and total):", nrow(crime_raw), "\n")
+cat("District population rows:", nrow(population_raw), "\n")
+```
+
+# Data Preprocessing and Integration
+
+## Apartment prices per square meter
+
+Apartment transaction prices are recorded in units of 10,000 Korean won (KRW). To standardize prices across apartments of different sizes, transaction prices were divided by apartment area in square meters.
+
+The resulting values represent apartment transaction prices per square meter (10,000 KRW/m²). These values were then aggregated by district and year to calculate the mean transaction price per square meter.
+
+```{r housing-clean}
+housing <- housing_raw %>%
+  transmute(
+    District = str_trim(District),
+    Year = as.integer(Year),
+    price_per_m2 = as.numeric(`Price (Won)`) / as.numeric(`Area (m2)`)
+  ) %>%
+  filter(is.finite(price_per_m2), price_per_m2 > 0)
+
+housing_district_year <- housing %>%
+  group_by(District, Year) %>%
+  summarise(mean_price_per_m2 = mean(price_per_m2),
+            transactions = n(), .groups = "drop")
+```
+
+## Population by district and year
+Population data for Seoul's 25 districts were reshaped from wide to long format using pivot_longer().
+
+The data were organized by district and year to support integration with the crime dataset. Population values were converted to numeric format, and records with missing or nonpositive population values were excluded.
+
+District-level population statistics were used to calculate crime occurrence rates per 100,000 residents.
+
+```{r population-clean}
+population <- population_raw %>%
+  pivot_longer(cols = matches("^20(1[4-9]|2[0-2])$"),
+               names_to = "Year", values_to = "Population") %>%
+  mutate(District = str_trim(District), Year = as.integer(Year),
+         Population = parse_number(as.character(Population))) %>%
+  filter(!is.na(Population), Population > 0)
+```
+
+
+## Crime occurrences by District, Year and Category
+
+The crime dataset contains annual records for five major crime categories: murder, robbery, rape, larceny, and violence.
+
+The dataset was cleaned by excluding non-observation rows and reorganizing the records into a long-format structure with district, year, crime category, and occurrence count.
+
+Crime occurrence data were then merged with population statistics using district and year as matching variables.
+
+To account for differences in population size, crime rates were calculated per 100,000 residents using the following formula:
+
+**Crime Rate = (Crime Occurrences / Population) × 100,000**
+
+```{r crime-clean}
+
+crime_categories <- c("Murder", "Robbery", "Rape", "Larceny", "Violence")
+crime_years <- 2014:2022
+
+expected_columns <- 1 + length(crime_categories) * length(crime_years)
+stopifnot(ncol(crime_raw) == expected_columns)
+
+# Verify the original crime category order 
+expected_categories <- rep(crime_categories, times = length(crime_years))
+
+actual_categories <- as.character(
+  unlist(crime_raw[1, -1], use.names = FALSE)
+)
+
+stopifnot(
+  identical(actual_categories, expected_categories)
+)
+
+
+crime_tidy <- crime_raw %>%
+  filter(!District %in% c("District", "Total")) %>%
+  set_names(c("District", paste(rep(crime_years, each = 5),
+                                rep(crime_categories, times = 9), sep = "__"))) %>%
+  pivot_longer(-District, names_to = c("Year", "Crime"),
+               names_sep = "__", values_to = "Occurrences") %>%
+  mutate(
+    District = str_trim(District),
+    Year = as.integer(Year),
+    Occurrences = parse_number(as.character(Occurrences))
+  )
+
+
+crime_rates <- crime_tidy %>%
+  left_join(population, by = c("District", "Year")) %>%
+  mutate(rate_per_100k = Occurrences / Population * 100000)
+
+stopifnot(!anyDuplicated(crime_rates[c("District", "Year", "Crime")]))
+
+# Validate the processed data
+stopifnot(nrow(crime_tidy) == 25 * 9 * 5)
+stopifnot(!anyNA(crime_rates$Population))
+stopifnot(all(crime_rates$Population > 0))
+stopifnot(!anyNA(crime_rates$Occurrences))
+```
+
+## Merge datasets and check coverage
+
+The processed crime rates and apartment price data were combined using district and year as common identifiers.
+
+An inner join was applied to retain observations available in both datasets. Records containing non-finite crime rates or housing prices were excluded from the final analytical dataset.
+
+Data coverage was then examined to verify the number of districts, years, and district-year combinations included in the analysis.
+
+```{r merge-and-check}
+analysis_long <- crime_rates %>%
+  inner_join(housing_district_year, by = c("District", "Year")) %>%
+  filter(is.finite(rate_per_100k), is.finite(mean_price_per_m2))
+
+coverage <- analysis_long %>%
+  summarise(districts = n_distinct(District),
+            years = n_distinct(Year),
+            district_years = n_distinct(paste(District, Year)),
+            missing_rates = sum(is.na(rate_per_100k)))
+kable(coverage)
+
+# Validate the merged district-year-crime dataset
+stopifnot(
+  nrow(analysis_long) == 25 * 9 * 5,
+  n_distinct(analysis_long$District) == 25,
+  n_distinct(analysis_long$Year) == 9,
+  !anyNA(analysis_long$District),
+  !anyNA(analysis_long$Year),
+  all(is.finite(analysis_long$rate_per_100k)),
+  all(is.finite(analysis_long$mean_price_per_m2))
+)
+
+# Each district-year must contain exactly five crime categories
+crime_counts <- analysis_long %>%
+  count(District, Year)
+
+stopifnot(
+  nrow(crime_counts) == 25 * 9,
+  all(crime_counts$n == 5)
+)
+
+# Check for duplicate district-year-crime records
+stopifnot(
+  !anyDuplicated(
+    analysis_long[c("District", "Year", "Crime")]
+  )
+)
+
+```
+# Exploratory Data Analysis
+
+## Annual crime trends
+To examine changes in crime rates over time, the mean district-level crime rate was calculated for each crime category from 2014 to 2022.
+
+Line plots were generated to visualize annual trends in murder, robbery, rape, larceny, and violence.
+
+These visualizations allow us to compare how different crime categories changed over the study period and identify general patterns and fluctuations.
+
+```{r crime-trends}
+annual_crime <- analysis_long %>%
+  group_by(Year, Crime) %>%
+  summarise(mean_rate = mean(rate_per_100k), .groups = "drop")
+
+ggplot(annual_crime, aes(Year, mean_rate)) +
+  geom_line(color = "#2563eb", linewidth = 0.8) +
+  geom_point(color = "#2563eb") +
+  facet_wrap(~Crime, scales = "free_y") +
+  labs(title = "Mean district crime rates across Seoul",
+       subtitle = "Unweighted mean of districts; not Seoul-wide population-weighted rate",
+       x = "Year", y = "Incidents per 100,000 residents") +
+  theme_minimal()
+```
+
+## Annual housing-price trend
+
+Annual average apartment transaction prices per square meter were calculated using transaction-count-weighted district averages.
+
+A line plot was created to visualize changes in apartment prices between 2014 and 2022.
+
+This analysis provides an overview of housing market trends during the study period and establishes a basis for examining their relationship with crime rates.
+
+The reported prices are nominal values and have not been adjusted for inflation.
+
+```{r housing-trends}
+annual_housing <- housing_district_year %>%
+  group_by(Year) %>%
+  summarise(mean_price = weighted.mean(mean_price_per_m2, transactions),
+            n_transactions = sum(transactions), .groups = "drop")
+
+ggplot(annual_housing, aes(Year, mean_price)) +
+  geom_line(color = "#0f766e", linewidth = 1) +
+  geom_point(color = "#0f766e") +
+  labs(title = "Mean transaction price per m² by year",
+       subtitle = "Transaction-count-weighted mean; nominal prices, not inflation-adjusted",
+       x = "Year", y = "Average Apartment Price (10,000 KRW/m²)") +
+  theme_minimal()
+kable(annual_housing)
+```
+
+# Linear Regression Analysis
+
+Linear regression analysis was conducted to investigate the relationship between apartment prices and each of the five major crime categories.
+
+Five separate simple linear regression models were developed, with average apartment transaction price per square meter as the response variable and the corresponding crime rate per 100,000 residents as the explanatory variable.
+
+Each model was evaluated using regression coefficients, p-values, and the coefficient of determination (R²).
+
+The primary objective was to examine the direction and strength of the linear associations between individual crime rates and apartment prices.
+
+These exploratory models treat apartment prices as the response variable to preserve the original regression framework and visualize the associations across crime categories. A later section examines the same bivariate relationships with crime rates as the response variables. Reversing the predictor and response in simple linear regression changes the coefficient estimates and their interpretation but does not change R² or the two-sided p-value for testing a zero slope.
+
+```{r regression-models}
+crime_models <- analysis_long %>%
+  group_by(Crime) %>%
+  nest() %>%
+  mutate(model = map(data, ~lm(mean_price_per_m2 ~ rate_per_100k, data = .x)),
+         coefficients = map(model, tidy),
+         statistics = map(model, glance))
+
+model_comparison <- crime_models %>%
+  transmute(Crime,
+            slope = map_dbl(coefficients, ~.x$estimate[.x$term == "rate_per_100k"]),
+            p_value = map_dbl(coefficients, ~.x$p.value[.x$term == "rate_per_100k"]),
+            r_squared = map_dbl(statistics, "r.squared"),
+            n = map_int(data, nrow)) %>%
+  arrange(desc(r_squared))
+
+kable(model_comparison, digits = 5,
+      caption = "Simple linear regression results (unadjusted; exploratory)")
+```
+## Scatter plots and fitted regression lines
+Scatter plots were created to visualize the relationship between crime rates and average apartment prices.
+
+Each plot represents the observed district-year data, with a fitted linear regression line and its 95% confidence interval.
+
+These visualizations help identify the direction of each linear relationship, the dispersion of observations, and potential differences across crime categories.
+
+```{r regression-plots, fig.height=7}
+ggplot(analysis_long, aes(rate_per_100k, mean_price_per_m2)) +
+  geom_point(color = "#2563eb", alpha = 0.5, size = 1.4) +
+  geom_smooth(method = "lm", se = TRUE, color = "#dc2626") +
+  facet_wrap(~Crime, scales = "free_x") +
+  labs(title = "Crime rates and apartment prices",
+       subtitle = "One unadjusted simple linear regression for each crime category",
+       x = "Recorded incidents per 100,000 residents",
+       y = "Average Apartment Price (10,000 KRW/m²)") +
+  theme_minimal()
+```
+## Model Comparison
+The explanatory power of the five regression models was compared using the coefficient of determination (R²).
+
+R² measures the proportion of variation in the response variable explained by the fitted model.
+
+Comparing R² values across crime categories helps identify which individual crime rates exhibit stronger linear associations with apartment prices.
+
+However, R² alone does not establish statistical significance or causality.
+
+```{r compare-r-squared}
+ggplot(model_comparison,
+       aes(x = reorder(Crime, r_squared), y = r_squared)) +
+  geom_col(fill = "#475569") +
+  coord_flip() +
+  labs(title = "Explanatory power of five simple regression models",
+       x = NULL, y = "In-sample R-squared") +
+  theme_minimal()
+```
+## Regression diagnostics
+
+Residual analysis was performed to assess the behavior of the fitted regression models.
+
+Residuals were plotted against fitted values to examine potential nonlinearity, unequal error variance, and unusual observations.
+
+Because the dataset contains repeated observations from the same districts over multiple years, the independence assumption of simple linear regression may not be fully satisfied.
+
+These diagnostic considerations are important when interpreting the reliability and limitations of the regression results.
+
+```{r model-diagnostics}
+model_residuals <- crime_models %>%
+  transmute(Crime, diagnostics = map(model, augment)) %>%
+  unnest(diagnostics)
+
+ggplot(model_residuals, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.4, color = "#2563eb") +
+  geom_hline(yintercept = 0, linetype = 2, color = "#dc2626") +
+  facet_wrap(~Crime, scales = "free_x") +
+  labs(title = "Residuals vs Fitted Apartment Prices", x = "Fitted Apartment Price (10,000 KRW/m²)", y = "Residual (10,000 KRW/m²)") +
+  theme_minimal()
+```
+
+# Hypothesis Testing
+
+## Research Hypotheses
+The objective of this analysis is to determine whether apartment prices and crime rates are statistically associated across Seoul's 25 districts from 2014 to 2022.
+
+Two statistical approaches are used:
+
+Regression-Based Hypothesis Testing: Examining linear associations between apartment prices and crime rates.
+
+Group Comparison: Comparing average crime rates between lower-priced and higher-priced apartment groups.
+
+For the regression analysis, the hypotheses are defined as follows:
+
+Null Hypothesis (H₀): There is no linear association between apartment prices and crime rates (β₁ = 0).
+
+Alternative Hypothesis (H₁): There is a linear association between apartment prices and crime rates (β₁ ≠ 0).
+
+The significance level is set at α = 0.05.
+
+## Total Crime Rate Calculation
+
+
+```{r total-crime-rate}
+# Verify that each district-year contains all five crime categories
+stopifnot(
+  all(
+    analysis_long %>%
+      count(District, Year) %>%
+      pull(n) == 5
+  )
+)
+
+# Verify that apartment prices are consistent within each district-year
+price_consistency <- analysis_long %>%
+  group_by(District, Year) %>%
+  summarise(
+    n_prices = n_distinct(mean_price_per_m2),
+    .groups = "drop"
+  )
+
+stopifnot(
+  all(price_consistency$n_prices == 1)
+)
+
+# Calculate total crime rates for each district-year
+total_crime <- analysis_long %>%
+  group_by(District, Year) %>%
+  summarise(
+    total_crime_rate = sum(rate_per_100k),
+    mean_price_per_m2 = first(mean_price_per_m2),
+    .groups = "drop"
+  )
+
+# Validate the total crime dataset
+stopifnot(
+  nrow(total_crime) == n_distinct(
+    paste(analysis_long$District, analysis_long$Year)
+  )
+)
+
+kable(
+  head(total_crime, 10),
+  digits = 2,
+  caption = "Total Crime Rates and Apartment Prices"
+)
+```
+
+## Exploratory Regression-Based Hypothesis Testing
+A simple linear regression model was fitted to examine the relationship between average apartment transaction prices per square meter and the combined rate of the five major crimes across Seoul's 25 districts from 2014 to 2022.
+
+Apartment price was used as the explanatory variable, while the total crime rate per 100,000 residents was used as the response variable.
+
+The null hypothesis states that the regression slope is equal to zero (H₀: β₁ = 0), while the alternative hypothesis states that the slope differs from zero (H₁: β₁ ≠ 0).
+
+The model was evaluated using the regression coefficient, p-value, and coefficient of determination (R²). The conventional significance level was set at α = 0.05.
+
+Because the model does not account for repeated observations within districts or common temporal effects, its statistical results are treated as exploratory.
+
+```{r total-crime-regression}
+# Fit a simple linear regression model
+total_crime_model <- lm(
+  total_crime_rate ~ mean_price_per_m2,
+  data = total_crime
+)
+
+# Display regression results
+summary(total_crime_model)
+
+# Extract model statistics
+total_crime_results <- broom::tidy(total_crime_model) %>%
+  filter(term == "mean_price_per_m2") %>%
+  select(term, estimate, std.error, statistic, p.value)
+
+total_crime_fit <- broom::glance(total_crime_model) %>%
+  select(r.squared, adj.r.squared)
+
+kable(
+  total_crime_results,
+  digits = 4,
+  caption = "Regression Results: Total Crime Rate and Apartment Prices"
+)
+
+kable(
+  total_crime_fit,
+  digits = 4,
+  caption = "Model Fit Statistics: Total Crime Rate Regression"
+)
+```
+
+### Interpretation of Total Crime Regression Results
+The simple linear regression model examined the relationship between average apartment transaction prices per square meter and the combined rate of five major crimes across Seoul's 25 districts from 2014 to 2022.
+
+The estimated regression coefficient for apartment prices was approximately −0.1259, indicating a negative association between apartment prices and total recorded crime rates in the unadjusted model. However, this relationship was not statistically significant under conventional OLS assumptions (p = 0.1870).
+
+The model had an R-squared value of approximately 0.0078, indicating that apartment prices explained less than 1% of the observed variation in total crime rates.
+
+Furthermore, this exploratory model did not account for district-specific characteristics, common year effects, or potential dependence among repeated observations within districts. Therefore, the conventional OLS p-value should be interpreted cautiously.
+
+Overall, the simple regression provided limited evidence of a linear association between apartment prices and total recorded crime rates. The fixed effects analysis presented later in this report provides an additional assessment that accounts for district and year effects and uses district-clustered robust standard errors.
+
+## Individual Crime Regression Analysis
+Separate simple linear regression models were fitted to investigate the associations between average apartment prices and the five major crime categories: murder, robbery, rape, larceny, and violence.
+
+For each model, average apartment transaction price per square meter was used as the explanatory variable, while the corresponding crime rate per 100,000 residents was used as the response variable.
+
+The null hypothesis for each model was that the regression slope was equal to zero (H₀: β₁ = 0), while the alternative hypothesis was that the slope differed from zero (H₁: β₁ ≠ 0).
+
+Regression coefficients, p-values, and R² values were calculated. Because five hypotheses were tested, the Benjamini–Hochberg (BH) procedure was applied to control the false discovery rate at 0.05.
+
+These models were used as exploratory analyses and did not account for district-specific effects, common year effects, or dependence among repeated observations within districts.
+
+These regressions reverse the response and explanatory variables used in the earlier exploratory models to express changes in recorded crime rates in relation to apartment prices. They are alternative specifications of the same bivariate relationships, not independent confirmation of the earlier results. Accordingly, their unadjusted slope-test p-values and R² values are identical to those of the corresponding earlier models. The Benjamini–Hochberg adjustment is applied here to the five conventional OLS p-values.
+
+```{r individual-crime-hypothesis}
+individual_crime_models <- analysis_long %>%
+  group_by(Crime) %>%
+  nest() %>%
+  mutate(
+    model = map(
+      data,
+      ~ lm(rate_per_100k ~ mean_price_per_m2, data = .x)
+    ),
+    coefficients = map(model, broom::tidy),
+    statistics = map(model, broom::glance)
+  )
+
+individual_crime_results <- individual_crime_models %>%
+  transmute(
+    Crime,
+    slope = map_dbl(
+      coefficients,
+      ~ .x$estimate[.x$term == "mean_price_per_m2"]
+    ),
+    p_value = map_dbl(
+      coefficients,
+      ~ .x$p.value[.x$term == "mean_price_per_m2"]
+    ),
+    r_squared = map_dbl(statistics, "r.squared"),
+    n = map_int(data, nrow)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    p_adjusted = p.adjust(p_value, method = "BH"),
+    conclusion = if_else(
+      p_value < 0.05,
+      "Reject H0",
+      "Fail to reject H0"
+    ),
+    adjusted_conclusion = if_else(
+      p_adjusted < 0.05,
+      "Reject H0",
+      "Fail to reject H0"
+    )
+  ) %>%
+  arrange(p_value)
+
+kable(
+  individual_crime_results %>%
+    select(Crime, slope, p_value, p_adjusted,
+           r_squared, adjusted_conclusion),
+  digits = 5,
+  caption = "Individual Crime Regression Results with BH-Adjusted p-values"
+)
+```
+
+### Interpretation of Individual Crime Regression Results
+
+The individual regression models revealed differences in the direction and strength of the observed associations between apartment prices and the five major crime categories.
+
+Before multiple testing adjustment, rape (p = 0.00009), robbery (p = 0.00931), and violence (p = 0.03401) showed statistically significant associations under conventional OLS assumptions.
+
+After applying the Benjamini–Hochberg procedure, only rape (adjusted p = 0.00046) and robbery (adjusted p = 0.02327) remained below the 0.05 threshold. Violence (adjusted p = 0.05668), murder (adjusted p = 0.06515), and larceny (adjusted p = 0.26995) did not meet the adjusted significance threshold.
+
+The rape model exhibited a positive regression coefficient, whereas the robbery model exhibited a negative coefficient.
+
+However, all five models demonstrated relatively low explanatory power, with R² values ranging from approximately 0.0055 to 0.0664. The highest R² indicated that apartment prices explained only about 6.64% of the observed variation in the corresponding crime rate.
+
+These findings suggest that the observed associations vary across crime categories, but apartment prices alone explain a limited proportion of variation in crime rates.
+
+Importantly, the BH adjustment addresses multiple hypothesis testing but does not correct for district-level dependence or omitted confounding variables. Therefore, the reported significance levels should be interpreted as exploratory rather than definitive evidence of an association.
+
+# Housing Price Group Comparison
+## High/Low Housing Price Groups
+
+To compare crime rates between districts with different housing price levels, Seoul's 25 districts were classified into Low-Price and High-Price groups based on their average apartment transaction prices per square meter.
+
+Because apartment prices changed substantially between 2014 and 2022, the median housing price was calculated separately for each year rather than using a single median across the entire study period.
+
+Districts with average housing prices below their respective annual median were assigned to the Low-Price group, while districts with prices equal to or above the annual median were assigned to the High-Price group.
+
+This approach allows districts to be compared relative to other districts within the same year, reducing the influence of overall housing price increases over time.
+
+The resulting groups are used to examine differences in total crime rates per 100,000 residents. These comparisons are descriptive and do not establish a causal relationship between housing prices and crime.
+
+
+
+```{r housing-price-groups}
+# Classify districts using each year's median housing price
+housing_groups <- total_crime %>%
+  group_by(Year) %>%
+  mutate(
+    yearly_median_price = median(
+      mean_price_per_m2,
+      na.rm = TRUE
+    ),
+    Price_Group = if_else(
+      mean_price_per_m2 < yearly_median_price,
+      "Low",
+      "High"
+    ),
+    Price_Group = factor(
+      Price_Group,
+      levels = c("Low", "High")
+    )
+  ) %>%
+  ungroup()
+
+# Verify the number of districts in each group by year
+group_counts <- housing_groups %>%
+  count(Year, Price_Group) %>%
+  tidyr::pivot_wider(
+    names_from = Price_Group,
+    values_from = n
+  )
+
+group_counts <- group_counts %>%
+  bind_rows(
+    group_counts %>%
+      summarise(
+        Year = NA_integer_,
+        Low = sum(Low),
+        High = sum(High)
+      )
+  ) %>%
+  mutate(
+    Year = if_else(is.na(Year), "Total", as.character(Year))
+  )
+
+knitr::kable(
+  group_counts,
+  caption = "Housing Price Group Distribution by Year"
+)
+```
+
+
+## Housing Price Group Distribution
+
+```{r housing-group-boxplot, fig.width=8, fig.height=5}
+ggplot(
+  housing_groups,
+  aes(x = Price_Group, y = total_crime_rate, fill = Price_Group)
+) +
+  geom_boxplot(alpha = 0.7, outlier.alpha = 0.5) +
+  labs(
+    title = "Total Crime Rates by Housing Price Group",
+    subtitle = "Seoul, 2014–2022",
+    x = "Housing Price Group",
+    y = "Total Crime Rate per 100,000 Residents"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The boxplots show that the High-Price group generally had a higher median total crime rate than the Low-Price group across the pooled 2014–2022 district-year observations.
+
+The High-Price group also exhibited greater variability and a larger number of high-crime outliers, with several observations exceeding 3,000 incidents per 100,000 residents. In contrast, the Low-Price group displayed a narrower distribution with fewer extreme observations.
+
+These descriptive patterns suggest that districts classified into the High-Price group tended to exhibit higher recorded crime rates in the pooled sample. However, the distributions overlap substantially, and the observed differences may be influenced by district-specific characteristics and unusually high crime rates in certain districts.
+
+Because each district contributes repeated observations across years, the boxplots do not establish statistical significance or a causal relationship between apartment prices and crime.
+
+
+## Year-Stratified Mean Difference
+
+To compare crime rates across housing price groups while accounting for differences between calendar years, the mean total crime rate was calculated separately for the Low-Price and High-Price groups within each year from 2014 to 2022.
+
+For each year, the difference was defined as the Low-Price group mean minus the High-Price group mean. A negative difference therefore indicates that the High-Price group had a higher average crime rate.
+
+The annual differences were then averaged across all nine years, giving each year equal weight. This approach provides a descriptive summary of the group differences over the study period without assuming that the district-year observations are independent.
+
+
+```{r year-stratified-difference}
+# Calculate annual mean crime rates by housing price group
+annual_group_comparison <- housing_groups %>%
+  group_by(Year, Price_Group) %>%
+  summarise(
+    mean_rate = mean(total_crime_rate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = Price_Group,
+    values_from = mean_rate
+  ) %>%
+  mutate(
+    difference_low_minus_high = Low - High
+  ) %>%
+  arrange(Year)
+
+# Define reusable statistic for subsequent robustness analyses
+yearly_difference <- function(data) {
+  annual <- data %>%
+    group_by(Year, Price_Group) %>%
+    summarise(
+      mean_rate = mean(total_crime_rate),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = Price_Group,
+      values_from = mean_rate
+    )
+
+  mean(annual$Low - annual$High)
+}
+
+# Equal-weighted average of the nine annual differences
+observed_stat <- yearly_difference(housing_groups)
+
+knitr::kable(
+  annual_group_comparison,
+  digits = 2,
+  caption = "Annual Crime Rate Differences by Housing Price Group"
+)
+
+cat(
+  "\nAverage annual difference (Low - High):",
+  round(observed_stat, 2),
+  "incidents per 100,000 residents\n"
+)
+```
+### Interpretation of Year-Stratified Mean Differences
+
+The annual comparisons showed that the High-Price group had a higher mean total crime rate than the Low-Price group in each year from 2014 to 2022.
+
+The equal-weighted average difference across the nine years was approximately −382.70 incidents per 100,000 residents (Low minus High).
+
+Although the negative differences were consistent across years, their magnitudes varied. This pattern suggests a persistent descriptive difference in recorded crime rates between the two housing price groups.
+
+However, the comparison does not account for all district-specific characteristics or the repeated observation of the same districts over time. Moreover, some districts with unusually high crime rates may contribute disproportionately to the observed difference.
+
+Therefore, the results should be interpreted as a descriptive association rather than evidence that higher housing prices lead to higher crime rates.
+
+
+## Bootstrap Confidence Interval
+
+```{r bootstrap-confidence-interval}
+
+set.seed(102)
+n_boot <- 5000
+
+districts <- unique(housing_groups$District)
+
+cluster_bootstrap <- function() {
+  sampled <- sample(
+    districts,
+    size = length(districts),
+    replace = TRUE
+  )
+
+  boot <- tibble(
+    District = sampled,
+    bootstrap_id = seq_along(sampled)
+  ) %>%
+    left_join(housing_groups, by = "District")
+
+  # Check whether all nine years contain both groups
+  valid <- boot %>%
+    group_by(Year) %>%
+    summarise(
+      n_groups = n_distinct(Price_Group),
+      .groups = "drop"
+    ) %>%
+    summarise(
+      valid = n() == 9 && all(n_groups == 2)
+    ) %>%
+    pull(valid)
+
+  if (!valid) {
+    return(NA_real_)
+  }
+
+  # Recalculate the year-stratified mean difference
+  yearly_difference(boot)
+}
+
+bootstrap_all <- replicate(n_boot, cluster_bootstrap())
+
+bootstrap_stats <- bootstrap_all[is.finite(bootstrap_all)]
+
+bootstrap_ci <- quantile(
+  bootstrap_stats,
+  probs = c(0.025, 0.975)
+)
+
+cat("Observed difference:", round(observed_stat, 4), "\n")
+
+cat("Requested bootstrap replicates:", n_boot, "\n")
+
+cat("Valid bootstrap replicates:", length(bootstrap_stats), "\n")
+
+cat(
+  "Valid replicate percentage:",
+  round(100 * length(bootstrap_stats) / n_boot, 2),
+  "%\n"
+)
+
+cat(
+  "95% Bootstrap CI:",
+  round(bootstrap_ci[1], 4), "to",
+  round(bootstrap_ci[2], 4), "\n"
+)
+```
+
+A district-cluster bootstrap was used to estimate uncertainty in the equal-weighted average annual crime rate difference between the Low-Price and High-Price groups.
+
+In each bootstrap iteration, Seoul's 25 districts were sampled with replacement. All nine annual observations associated with each selected district were retained together to preserve the repeated-observation structure within districts.
+
+The original year-specific housing price classifications were held fixed during resampling. The average annual difference was recalculated for each bootstrap sample, and iterations lacking both housing price groups in any year were excluded.
+
+A 95% percentile bootstrap confidence interval was calculated using the 2.5th and 97.5th percentiles of the valid bootstrap estimates.
+
+The procedure provides a measure of uncertainty for the descriptive group difference, conditional on the specified classification and resampling approach. It does not control for district-specific confounding factors or establish causality.
+
+
+```{r bootstrap-confidence-plot}
+ggplot(tibble(statistic = bootstrap_stats), aes(statistic)) +
+  geom_histogram(bins = 40, fill = "#64748b", color = "white") +
+  geom_vline(xintercept = observed_stat, color = "#dc2626", linewidth = 1) +
+  geom_vline(xintercept = bootstrap_ci, color = "#0f766e",
+             linetype = "dashed", linewidth = 0.9) +
+  labs(title = "District-Cluster Bootstrap Distribution",
+       subtitle = "95% percentile interval for equal-weighted annual mean difference",
+       x = "Mean annual crime-rate difference (Low - High, per 100,000 residents)", y = "Frequency") +
+  theme_minimal()
+```
+### Interpretation of Bootstrap Confidence Interval
+
+The district-cluster bootstrap was conducted using 5,000 resamples, all of which were valid (100%).
+
+The observed equal-weighted annual mean difference between the Low-Price and High-Price groups was −382.70 incidents per 100,000 residents. The resulting 95% percentile bootstrap confidence interval ranged from −806.98 to −51.40.
+
+The confidence interval did not include zero, indicating that the central 95% of bootstrap estimates were negative under the specified district-cluster resampling procedure. This is consistent with the observed pattern in which the High-Price group had higher average recorded crime rates than the Low-Price group.
+
+However, the relatively wide interval indicates substantial uncertainty regarding the magnitude of the difference. The bootstrap procedure retained the original housing price group classifications and did not adjust for potentially confounding district characteristics.
+
+Therefore, these findings describe uncertainty in the observed group difference under the specified resampling assumptions. They do not establish a causal or independent effect of apartment prices on crime rates and should not be treated as a substitute for the fixed effects regression results.
+
+## Effect Size Analysis: Cohen's d
+
+For each year, Cohen's d standardizes the Low-minus-High mean crime rate difference by the pooled within-year standard deviation. Annual estimates are presented individually, then summarized by their equally weighted mean. This mean of standardized effects is **not** identical to standardizing the overall mean annual difference; the two statistics answer related but distinct questions. Some annual groups are small (12–13 observations), and repeated district observations are not eliminated by standardization.
+
+```{r cohens-d}
+cohens_d_by_year <- housing_groups %>%
+  group_by(Year) %>%
+  group_modify(~ {
+    low <- .x$total_crime_rate[.x$Price_Group == "Low"]
+    high <- .x$total_crime_rate[.x$Price_Group == "High"]
+    n_low <- length(low)
+    n_high <- length(high)
+    pooled_sd <- sqrt(((n_low - 1) * var(low) +
+                       (n_high - 1) * var(high)) /
+                      (n_low + n_high - 2))
+    tibble(n_low = n_low, n_high = n_high,
+           mean_difference = mean(low) - mean(high),
+           pooled_sd = pooled_sd,
+           cohens_d = if_else(
+             is.finite(pooled_sd) && pooled_sd > 0,
+             (mean(low) - mean(high)) / pooled_sd,
+             NA_real_
+           ))
+  }) %>%
+  ungroup()
+
+average_cohens_d <- mean(cohens_d_by_year$cohens_d)
+kable(cohens_d_by_year, digits = 4,
+      caption = "Annual Cohen's d: Relative Housing Price Groups")
+cat("Equal-weighted mean of annual Cohen's d:", round(average_cohens_d, 4), "\n")
+```
+
+
+```{r cohens-d-plot}
+ggplot(cohens_d_by_year, aes(factor(Year), cohens_d)) +
+  geom_col(fill = "#64748b", width = 0.65) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#dc2626") +
+  labs(title = "Annual Standardized Group Differences",
+       subtitle = "Cohen's d (Low - High), 2014–2022",
+       x = "Year", y = "Cohen's d") +
+  theme_minimal()
+```
+
+### Interpretation of Cohen's d
+
+The annual Cohen's d estimates were negative throughout the 2014–2022 study period, indicating that the High-Price group consistently exhibited higher mean total crime rates than the Low-Price group.
+
+From 2014 to 2020, the standardized differences ranged from approximately −0.73 to −0.84, suggesting relatively substantial differences in crime rates between the two housing price groups. In contrast, the magnitudes decreased considerably in 2021 (d = −0.2852) and 2022 (d = −0.2602).
+
+The equally weighted mean of the nine annual Cohen's d values was −0.6711. This statistic summarizes the average standardized difference across years and should not be interpreted as a single pooled Cohen's d calculated from all district-year observations.
+
+Although the results indicate persistent descriptive differences between the groups, their magnitude varied over time. The marked reduction in standardized differences during 2021–2022 suggests that the separation between the two groups became smaller toward the end of the study period.
+
+These findings should be interpreted cautiously because the group comparisons may be influenced by districts with unusually high crime rates, and Cohen's d does not account for repeated district observations or potentially confounding district characteristics. The standardized differences do not establish statistical significance or causality.
+
+## Leave-One-District-Out Sensitivity Analysis
+A leave-one-district-out sensitivity analysis was conducted to assess whether the observed difference in total crime rates between housing price groups was driven by a single district.
+
+Each of Seoul's 25 districts was excluded individually, along with all nine of its annual observations. The equal-weighted average of the annual Low-minus-High crime rate differences was then recalculated using the remaining districts.
+
+The original year-specific housing price classifications were held fixed to isolate the effect of excluding each district.
+
+This analysis evaluates the sensitivity of the descriptive group difference to individual districts. It does not constitute a statistical significance test or control for potentially confounding characteristics.
+
+
+```{r district-sensitivity}
+# Leave-one-district-out sensitivity analysis
+district_sensitivity <- tibble(
+  excluded_district = unique(housing_groups$District)
+) %>%
+  mutate(
+    mean_difference = purrr::map_dbl(
+      excluded_district,
+      ~ yearly_difference(
+        housing_groups %>%
+          filter(District != .x)
+      )
+    )
+  ) %>%
+  mutate(
+    change_from_full = mean_difference - observed_stat
+  ) %>%
+  arrange(mean_difference)
+
+knitr::kable(
+  district_sensitivity,
+  digits = 2,
+  caption = "Leave-One-District-Out Sensitivity Analysis"
+)
+
+cat(
+  "Full-sample difference:",
+  round(observed_stat, 2), "\n"
+)
+
+cat(
+  "Minimum leave-one-out difference:",
+  round(min(district_sensitivity$mean_difference), 2), "\n"
+)
+
+cat(
+  "Maximum leave-one-out difference:",
+  round(max(district_sensitivity$mean_difference), 2), "\n"
+)
+
+cat(
+  "All differences negative:",
+  all(district_sensitivity$mean_difference < 0), "\n"
+)
+```
+
+### Interpretation of Sensitivity Analysis
+
+The leave-one-district-out sensitivity analysis examined how the equal-weighted average annual crime rate difference changed when each of Seoul's 25 districts was excluded individually.
+
+The full-sample difference was −382.70 incidents per 100,000 residents. Across all 25 exclusion scenarios, the estimated differences remained negative, ranging from −431.95 to −227.10. This indicates that the negative direction of the descriptive group difference was not driven solely by any single district.
+
+However, the magnitude of the difference was sensitive to certain districts. Excluding Jung-gu reduced the absolute difference from 382.70 to 227.10 incidents per 100,000 residents, a reduction of approximately 40.7%. Excluding Jongno-gu also reduced the absolute difference, resulting in an estimate of −327.22.
+
+In contrast, excluding Yangcheon-gu increased the absolute difference to 431.95 incidents per 100,000 residents.
+
+These findings suggest that the direction of the observed group difference was relatively stable, while its magnitude was influenced by particular districts, especially Jung-gu.
+
+Because the analysis retained the original annual housing price classifications, the results measure sensitivity to district exclusion under a fixed group definition. This analysis does not establish statistical significance, account for all confounding factors, or demonstrate a causal relationship between housing prices and crime rates.
+
+# Fixed Effects Regression Analysis
+```{r fixed-effects-check}
+# Two-way fixed effects regression
+fixed_effects_model <- lm(
+  total_crime_rate ~ mean_price_per_m2 +
+    factor(District) + factor(Year),
+  data = total_crime
+)
+
+# Extract the housing price coefficient
+fixed_effects_coef <- broom::tidy(fixed_effects_model) %>%
+  filter(term == "mean_price_per_m2") %>%
+  select(term, estimate, std.error, statistic, p.value)
+
+kable(
+  fixed_effects_coef,
+  digits = 5,
+  caption = "Two-Way Fixed Effects Regression (Conventional OLS SE)"
+)
+```
+
+Although the conventional OLS standard errors yield a p-value below 0.05, repeated observations within districts may violate the assumption of independent errors. Therefore, district-clustered robust standard errors are used as the primary basis for statistical inference in this report.
+
+## District and Year Fixed Effects
+
+To further examine the relationship between apartment prices and total crime rates, a two-way fixed effects regression model was estimated using district-year observations from 2014 to 2022.
+
+District fixed effects were included to account for time-invariant characteristics of each district, while year fixed effects were used to account for common temporal changes affecting all districts.
+
+Average apartment transaction price per square meter was used as the explanatory variable, and the combined crime rate per 100,000 residents was used as the response variable.
+
+Unlike the exploratory simple regression models, this approach examines whether changes in apartment prices within districts over time are associated with changes in crime rates after accounting for district-specific and common year effects.
+
+The analysis remains observational and does not establish causality.
+
+
+## Cluster-Robust Statistical Inference
+
+To account for potential dependence among repeated observations within the same district, cluster-robust standard errors were calculated at the district level.
+
+The regression coefficients remained unchanged, but the standard errors and hypothesis test statistics were adjusted to allow for within-district correlation.
+
+Statistical inference was conducted using district-clustered standard errors with a small-sample adjustment and degrees of freedom based on the number of districts.
+
+Because the analysis includes only 25 district clusters, the resulting statistical inference should still be interpreted cautiously.
+```{r cluster-robust-inference}
+# District-clustered covariance matrix
+cluster_vcov <- sandwich::vcovCL(
+  fixed_effects_model,
+  cluster = total_crime$District,
+  type = "HC1"
+)
+
+# Cluster-robust coefficient tests
+cluster_results <- lmtest::coeftest(
+  fixed_effects_model,
+  vcov. = cluster_vcov,
+  df = n_distinct(total_crime$District) - 1
+)
+
+# Extract the housing price coefficient
+price_effect <- cluster_results[
+  "mean_price_per_m2",
+  ,
+  drop = FALSE
+]
+
+kable(
+  price_effect,
+  digits = 5,
+  caption = "Fixed Effects Regression with District-Clustered Standard Errors"
+)
+```
+
+### Interpretation of Fixed Effects Results
+
+The two-way fixed effects regression estimated a positive coefficient for apartment prices (β₁ = 0.17657), with a district-clustered standard error of 0.15317.
+
+The coefficient was not statistically significant at the 0.05 level (t = 1.15276, p = 0.26036). Therefore, we fail to reject the null hypothesis that the housing price coefficient is equal to zero.
+
+Unlike the exploratory simple linear regression, which estimated a negative coefficient (β₁ = −0.12592), the fixed effects model produced a positive coefficient after accounting for district-specific characteristics and common year effects.
+
+However, neither model provided sufficient statistical evidence of a nonzero linear association between apartment prices and total crime rates.
+
+The difference in coefficient direction suggests that district-level differences and temporal patterns may influence the observed relationship. Nevertheless, these results do not establish causality, and the relatively small number of district clusters warrants caution when interpreting statistical inference.
+
+
+
+# Results & Discussion
+
+## Summary of Regression Findings
+
+The exploratory simple linear regression analysis found a weak negative association between average apartment prices per square meter and total crime rates across Seoul's 25 districts from 2014 to 2022. However, the association was not statistically significant under conventional OLS assumptions (β = −0.12592, p = 0.187), and the model explained only approximately 0.78% of the variation in total crime rates (R² = 0.0078).
+
+When separate regression models were fitted for the five major crime categories, the results varied by crime type. After applying the Benjamini–Hochberg adjustment, rape and robbery remained below the 0.05 significance threshold under conventional OLS assumptions. Nevertheless, all five models had relatively low explanatory power, and the adjusted p-values did not account for repeated observations within districts.
+
+To address this limitation, a two-way fixed effects regression model was estimated with district and year effects and district-clustered standard errors. The estimated housing price coefficient was positive (β = 0.17657), but it was not statistically significant (p = 0.26036).
+
+The coefficient changed from negative in the exploratory OLS model to positive in the two-way fixed effects model, suggesting that the estimated association is sensitive to the inclusion of district and year effects. However, neither specification provided sufficient statistical evidence of a nonzero linear association between apartment prices and total crime rates under its respective inference assumptions.
+
+## Housing Price Group Comparisons
+
+Districts were classified into Low-Price and High-Price groups using the median apartment price within each year. This produced 12 Low-Price districts and 13 High-Price districts annually.
+
+The High-Price group exhibited a higher mean total crime rate in all nine years. The equal-weighted average annual difference, calculated as Low minus High, was −382.70 incidents per 100,000 residents.
+
+The magnitude of this difference varied over time. The annual difference decreased from −537.17 in 2014 to −119.07 in 2022, with substantially smaller differences observed in 2021 and 2022 than in earlier years.
+
+The annual Cohen's d estimates were also negative throughout the study period. Their equally weighted mean was −0.6711, while the standardized differences were noticeably smaller in 2021 and 2022.
+
+Together, these results show a descriptive pattern in which districts with relatively higher apartment prices tended to have higher recorded crime rates. However, the group comparisons do not isolate the independent association between housing prices and crime rates after controlling for district characteristics.
+
+## Uncertainty and Sensitivity Analysis
+
+A district-cluster bootstrap was conducted using 5,000 resamples, preserving the annual observations associated with each selected district. All 5,000 resamples were valid.
+
+The resulting 95% percentile bootstrap confidence interval for the equal-weighted annual Low-minus-High difference ranged from −806.98 to −51.40 incidents per 100,000 residents.
+
+Although the interval did not include zero, it was relatively wide, indicating uncertainty about the magnitude of the descriptive group difference. The bootstrap retained the original housing price group classifications and did not control for potentially confounding district characteristics.
+
+The leave-one-district-out sensitivity analysis provided additional insight into the stability of the results. The estimated differences remained negative when any single district was excluded, ranging from −431.95 to −227.10.
+
+However, excluding Jung-gu reduced the absolute difference by approximately 40.7%, demonstrating that certain districts contributed substantially to the magnitude of the observed group difference.
+
+## Overall Interpretation
+
+The analyses revealed an important distinction between descriptive group differences and regression-based statistical inference.
+
+The year-stratified comparisons consistently showed higher average recorded crime rates in the High-Price group. However, the two-way fixed effects regression did not identify a statistically significant linear association between housing prices and total crime rates after accounting for district and year effects.
+
+These findings are not necessarily contradictory. Group comparisons describe differences between districts classified by relative housing prices, whereas the fixed effects model examines changes in housing prices and crime rates within districts over time, after accounting for common year effects.
+
+Overall, the results suggest that the relationship between apartment prices and recorded crime rates in Seoul is sensitive to the analytical method and potentially influenced by district-specific characteristics.
+
+Consequently, the findings support a descriptive difference between housing price groups but do not provide sufficient evidence that changes in apartment prices are independently associated with changes in total crime rates, or that housing prices causally affect crime.
+
+# Limitations
+
+This study has several limitations that should be considered when interpreting the relationship between apartment prices and recorded crime rates in Seoul.
+
+**1. Observational Data and Causal Interpretation**
+
+The analysis relies on observational data from 2014 to 2022. Although associations between apartment prices and crime rates can be examined, the results cannot establish that housing prices cause changes in crime rates or vice versa. Other factors may influence both variables.
+
+**2. District-Level Aggregation**
+
+Both housing prices and crime rates were analyzed at the district-year level. As a result, variation within individual districts was not captured. District-level associations should not be interpreted as relationships between individual residents, households, or properties.
+
+**3. Unobserved and Time-Varying Confounding Factors**
+
+The fixed effects model accounts for time-invariant differences between districts and common year effects, but it does not control for all factors that change differently across districts over time. Changes in population composition, commercial activity, transportation infrastructure, or local development may influence both apartment prices and recorded crime rates.
+
+**4. Repeated Observations and Statistical Inference**
+
+The dataset contains repeated annual observations for the same 25 districts. Conventional OLS standard errors may not adequately reflect dependence within districts. District-clustered standard errors were therefore used in the fixed effects analysis, although inference remains sensitive to assumptions and the relatively small number of clusters.
+
+**5. Influence of High-Crime Districts**
+
+The descriptive comparisons were influenced by districts with unusually high recorded crime rates. In the leave-one-district-out analysis, excluding Jung-gu reduced the absolute average group difference by approximately 40.7%. This indicates that the magnitude of the observed group difference is sensitive to particular districts.
+
+**6. Housing Price Group Classification**
+
+High-Price and Low-Price groups were defined using the median apartment price within each year. These classifications reflect relative price levels rather than fixed monetary thresholds. The bootstrap and sensitivity analyses retained the original group classifications, so their results are conditional on that definition.
+
+**7. Housing Transaction Data and Crime Measurement**
+
+Housing prices were calculated from observed apartment transactions, which may not represent every apartment within a district equally. Differences in the properties sold across districts and years may affect average transaction prices.
+
+Crime rates were based on recorded occurrences of five major crime categories. These figures may not capture unreported incidents or all forms of crime, and recorded crime rates do not necessarily reflect residents' individual exposure to crime.
+
+**8. Study Period and Generalizability**
+
+The analysis covers Seoul's 25 districts from 2014 to 2022. The findings may not generalize to other cities or periods with different housing market conditions, crime patterns, or demographic characteristics.
+
+Taken together, these limitations indicate that the results should be interpreted primarily as descriptive and exploratory evidence. The analyses identify patterns in the observed district-level data but do not establish an independent causal effect of apartment prices on crime rates.
+
+# Conclusion
+
+This project examined the relationship between apartment transaction prices and recorded crime rates across Seoul's 25 districts from 2014 to 2022, using exploratory regression, housing price group comparisons, and fixed effects modeling.
+
+The descriptive analyses showed that districts in the High-Price group consistently had higher average recorded total crime rates than those in the Low-Price group. However, the two-way fixed effects regression did not find a statistically significant association between apartment prices and total crime rates after accounting for district and year effects and using district-clustered robust standard errors (p = 0.26036).
+
+The bootstrap and sensitivity analyses further demonstrated that the magnitude of the descriptive group difference was uncertain and influenced by particular districts.
+
+Overall, these findings highlight the importance of distinguishing between differences across districts and associations estimated after accounting for district and year effects. Although apartment prices and recorded crime rates exhibited descriptive patterns, the analysis did not establish an independent or causal effect of housing prices on crime rates.
+
